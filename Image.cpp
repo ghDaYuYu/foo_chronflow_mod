@@ -1,12 +1,13 @@
 #include "Image.h"
+#include "webp/include/decode.h"
+#include "libPPUI/gdiplus-helpers-webp.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "lib/stb_image.h"
-#include "lib/stb_image_resize.h"
 
+#include "lib/stb_image.h"
+#include "lib/stb_image_resize2.h"
 #include "ConfigData.h"
-#include "utils.h"
 
 using coverflow::configData;
 
@@ -59,8 +60,8 @@ void fixPath(pfc::string_base& path) {
 }
 }  // namespace
 
-Image::Image(malloc_ptr data, int width, int height, bool alpha)
-    : width(width), height(height), alpha(alpha), data(std::move(data)) {}
+Image::Image(malloc_ptr data, int width, int height, bool alpha, bool webp)
+    : width(width), height(height), alpha(alpha), webp(webp), data(std::move(data)) {}
 
 Image Image::fromFile(const char* filename) {
   auto wideName = pfc::stringcvt::string_wide_from_utf8(filename);
@@ -78,7 +79,7 @@ Image Image::fromFile(const char* filename) {
     //increase tcomp to 4 if this is a png8 with alpha channel
     stbi__context s;
     int testw, testh;
-    long pos = ftell(f);
+    const long pos = ftell(f);
     stbi__start_file(&s, f);
     if (stbi__png_info(&s, &testw, &testh, &tcomp));
     else
@@ -92,7 +93,7 @@ Image Image::fromFile(const char* filename) {
   if (data == nullptr) {
     throw std::runtime_error{"Failed to load image file"};
   }
-  return Image{std::move(data), width, height, tcomp>3};
+  return Image{std::move(data), width, height, tcomp>3, false};
 }
 
 bool findPngAlphaFromBuffer(const stbi_uc* buffer, int len) {
@@ -111,23 +112,106 @@ bool findPngAlphaFromBuffer(const stbi_uc* buffer, int len) {
   return (comp == 4 && ispng);
 }
 
+// extended GdiplusImageFromMem2 (libPPUI\gdiplus-helpers-webp.h) including WebP resize
+// please get in contact if it should be acknowledged in the component license terms  
+static std::unique_ptr<Gdiplus::Image> GdiplusImageFromMem3(const void* ptr, size_t bytes) {
+  GdiplusErrorHandler EH;
+  using namespace Gdiplus;
+  if (IsImageWebP(ptr, bytes)) {
+    WebPBitstreamFeatures bs;
+    if (WebPGetFeatures((const uint8_t*)ptr, bytes, &bs) != VP8_STATUS_OK) {
+      throw std::runtime_error("WebP decoding failure");
+    }
+
+    const int maxWidth = std::min(configData->MaxTextureSize, 1024);
+    auto scaledWidth = ReadyImageDims(bs.width, bs.height, maxWidth);
+
+    const Gdiplus::PixelFormat pf = PixelFormat32bppARGB;
+
+    const int pfBytes = 4;  // Gdiplus RGB is 4 bytes
+    int w = 0, h = 0;
+
+    /* GdiplusImageFromMem3 */
+    
+    WebPDecoderConfig config;
+    WebPInitDecoderConfig(&config);
+    config.options.no_fancy_upsampling = 1;
+    config.output.colorspace = MODE_BGRA;
+    config.options.use_scaling = scaledWidth != SIZE_MAX;
+    config.options.scaled_width = static_cast<int>(scaledWidth);
+    WebPDecode((const uint8_t*)ptr, bytes, &config);
+    w = config.output.width;
+    h = config.output.height;
+
+    uint8_t* decodedData = config.output.private_memory;
+
+    pfc::onLeaving scope([&config] { WebPFreeDecBuffer(&config.output); });
+
+    if (decodedData == nullptr || w <= 0 || h <= 0)
+      throw std::runtime_error("WebP decoding failure");
+
+    std::unique_ptr<Bitmap> ret(new Gdiplus::Bitmap(w, h, pf));
+    EH << ret->GetLastStatus();
+    Rect rc(0, 0, w, h);
+    Gdiplus::BitmapData bitmapData;
+    EH << ret->LockBits(&rc, 0, pf, &bitmapData);
+    uint8_t* target = (uint8_t*)bitmapData.Scan0;
+    const uint8_t* source = decodedData;
+    for (int y = 0; y < h; ++y) {
+      memcpy(target, source, w * pfBytes);
+      target += pfBytes * w;
+      source += pfBytes * w;
+    }
+
+    EH << ret->UnlockBits(&bitmapData);
+    return ret;
+  }
+  return GdiplusImageFromMem(ptr, bytes);
+}
+
 Image Image::fromFileBuffer(const void* buffer, size_t len) {
   int width;
   int height;
   int channels_in_file;
 
   int req_comp = 3;
-  if (configData->CoverArtEnablePngAlpha) {
-    if (findPngAlphaFromBuffer((stbi_uc*)buffer, static_cast<int>(len)))
-      req_comp = 4;
-  }
+  bool bWepP = IsImageWebP(buffer, len);
+  if (bWepP) {
+    //BGRA
+    auto gdi_data = GdiplusImageFromMem3(buffer, len);
 
-  malloc_ptr data{static_cast<void*>(stbi_load_from_memory(static_cast<const stbi_uc*>(buffer), static_cast<int>(len),
-                            &width, &height, &channels_in_file, req_comp))};
-  if (data == nullptr) {
-    throw std::runtime_error{"Failed to load image buffer"};
+    Image img = Image::fromGdiBitmapWebp(*(Gdiplus::Bitmap*)gdi_data.get());
+    img.webp  = true;
+    img.alpha = true;
+    WebPBitstreamFeatures bs;
+    if (WebPGetFeatures((const uint8_t*) buffer, len, &bs) !=
+        VP8_STATUS_OK) {
+      throw std::runtime_error("WebP decoding failure");
+    }
+    
+    img.alpha = bs.has_alpha;
+
+    Gdiplus::Bitmap* tmpBitmap = dynamic_cast<Gdiplus::Bitmap*>(gdi_data.get());
+
+    Image imgf = fromGdiBitmap(*tmpBitmap);
+    malloc_ptr data = std::move(imgf.data);
+    return img;
+
+  } else {
+
+    if (configData->CoverArtEnablePngAlpha) {
+      if (findPngAlphaFromBuffer((stbi_uc*)buffer, static_cast<int>(len)))
+        req_comp = 4;
+    }
+    malloc_ptr data{static_cast<void*>(stbi_load_from_memory(static_cast<const stbi_uc*>(buffer), static_cast<int>(len),
+        &width, &height, &channels_in_file, req_comp))};
+
+
+    if (data == nullptr) {
+      throw std::runtime_error{"Failed to load image buffer"};
+    }
+    return Image{std::move(data), width, height, req_comp == 4, false };
   }
-  return Image{std::move(data), width, height, req_comp == 4 }; //hasalpha
 }
 
 Image Image::fromResource(LPCTSTR pName, LPCTSTR pType, HMODULE hInst) {
@@ -180,27 +264,56 @@ Image Image::fromGdiBitmap(Gdiplus::Bitmap& bitmap) {
     p += 3;
   }
 
-  return Image(std::move(outBuffer), bitmapData.Width, bitmapData.Height, false);
+  return Image(std::move(outBuffer), bitmapData.Width, bitmapData.Height, false, false);
 }
 
-Image Image::resize(int width, int height) const {
-  int channels = alpha ? 4 : 3;
+Image Image::fromGdiBitmapWebp(Gdiplus::Bitmap& bitmap) {
+  Gdiplus::BitmapData bitmapData{};
+  Gdiplus::Rect rc(0, 0, bitmap.GetWidth(), bitmap.GetHeight());
+  if (Gdiplus::Ok != bitmap.LockBits(&rc, Gdiplus::ImageLockModeRead,
+                                     PixelFormat32bppARGB,
+                                     &bitmapData)) {
+    throw std::runtime_error{"Failed to lock bitmap data"};
+  }
+  auto _ = gsl::finally([&] { bitmap.UnlockBits(&bitmapData); });
+  size_t bufferSize = bitmapData.Width * bitmapData.Height * 4;
 
-  size_t new_size = width * height * channels;
+  malloc_ptr outBuffer{malloc(bufferSize)};
+  if (outBuffer == nullptr) {
+    throw std::bad_alloc{};
+  }
+  memcpy(outBuffer.get(), bitmapData.Scan0, bufferSize);
+
+  return Image(std::move(outBuffer), bitmapData.Width, bitmapData.Height, false, false);
+}
+
+
+Image Image::resize(int width, int height) const {
+
+  const size_t channels = alpha ? 4 : 3;
+
+  if (webp) {
+    throw std::runtime_error{"Failed to resize image"};
+  }
+
+  const size_t new_size = width * height * channels;
+
   // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
   malloc_ptr new_buffer{static_cast<stbi_uc*>(malloc(new_size))};
   if (new_buffer == nullptr) {
     throw std::bad_alloc{};
   }
 
-  int result =
-      stbir_resize_uint8_srgb(static_cast<stbi_uc*>(data.get()), this->width,
-                              this->height, 0, static_cast<stbi_uc*>(new_buffer.get()),
-                              width, height, 0, channels, /*alpha ? STBIR_FLAG_ALPHA_PREMULTIPLIED :*/ STBIR_ALPHA_CHANNEL_NONE, 0);
-  if (result != 1) {
+  auto result =
+      stbir_resize(static_cast<stbi_uc*>(data.get()), this->width,
+                              this->height, 0, static_cast<stbi_uc*>(new_buffer.get()), width, height, 0,
+                              static_cast<stbir_pixel_layout>(channels),
+                              STBIR_TYPE_UINT8_SRGB_ALPHA, STBIR_EDGE_ZERO, STBIR_FILTER_DEFAULT);
+
+  if (!result) {
     throw std::runtime_error{"Failed to resize image"};
   }
-  return Image{std::move(new_buffer), width, height, this->alpha};
+  return Image{std::move(new_buffer), width, height, this->alpha, this->webp};
 }
 
 std::optional<UploadReadyImage> loadAlbumArt(const metadb_handle_ptr& track,
@@ -291,34 +404,14 @@ UploadReadyImage loadSpecialArt(WORD resource, pfc::string8 userImage, bool hasA
 }
 
 UploadReadyImage::UploadReadyImage(Image&& src)
-    : image(std::move(src)), originalAspect(double(src.width) / src.height) {
+    : image(std::move(src)), originalAspect(static_cast<double>(src.width) / src.height) {
+
   const int maxSize = std::min(configData->MaxTextureSize, 1024);
+  size_t readyWidth = ReadyImageDims(src.width, src.height, maxSize);
 
-  int width = image.width;
-  int height = image.height;
-
-
-  // scale textures down to maxSize
-  if ((width > maxSize) || (height > maxSize)) {
-    if (width > height) {
-      height = int(maxSize / originalAspect);
-      width = maxSize;
-    } else {
-      width = int(originalAspect * maxSize);
-      height = maxSize;
-    }
-  }
-
-  // turn texture sizes into powers of two
-  int p2w = 1;
-  while (p2w < width) p2w = p2w << 1;
-  width = p2w;
-  int p2h = 1;
-  while (p2h < height) p2h = p2h << 1;
-  height = p2h;
-
-  if (width != image.width || height != image.height) {
-    image = image.resize(width, height);
+  if (!image.webp && readyWidth != SIZE_MAX) {
+    // resize
+    image = image.resize(readyWidth, readyWidth);
   }
 }
 
@@ -344,11 +437,13 @@ GLImage UploadReadyImage::upload() const {
   if (configData->TextureCompression) {
     glInternalFormat = image.alpha? GL_COMPRESSED_RGBA : GL_COMPRESSED_RGB;
   } else {
-    glInternalFormat = image.alpha ? GL_RGBA : GL_RGB;
+    glInternalFormat = image.alpha || image.webp ? GL_RGBA : GL_RGB;
   }
 
-  glTexImage2D(GL_TEXTURE_2D, 0, glInternalFormat, image.width, image.height, 0, image.alpha /*&& debugalpha*/? GL_RGBA : GL_RGB,
-               GL_UNSIGNED_BYTE, image.data.get());
+  glTexImage2D(GL_TEXTURE_2D, 0, glInternalFormat, image.width, image.height, 0,
+                    image.alpha ? image.webp ? GL_BGRA : GL_RGBA
+                   : image.webp ? GL_BGRA : GL_RGB,
+                    GL_UNSIGNED_BYTE, image.data.get());
   IF_DEBUG(console::out() << "GLUpload " << (time() - preLoad) * 1000 << " ms");
   return GLImage(std::move(texture), static_cast<float>(originalAspect), true);
 }
@@ -360,7 +455,7 @@ GLTexture::GLTexture() {
 GLTexture::GLTexture(GLTexture&& other) noexcept : glTexture(other.glTexture) {
   other.glTexture = 0;
 }
-GLTexture::GLTexture(GLTexture&& other, bool hasalpha) noexcept : glTexture(other.glTexture), hasAlpha(hasalpha) {
+GLTexture::GLTexture(GLTexture&& other, bool hasalpha) noexcept : glTexture(other.glTexture) {
   other.glTexture = 0;
 }
 
@@ -415,6 +510,6 @@ GLImage loadSpinner() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(
-      GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-  return GLImage(std::move(texture), 1.0);
+    GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+  return GLImage(std::move(texture), 1.0, true);
 }

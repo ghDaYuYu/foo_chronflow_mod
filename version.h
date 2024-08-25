@@ -1,12 +1,12 @@
 #pragma once
 #define COMPONENT_NAME_LABEL "Coverflow"
 #define COMPONENT_NAME "foo_coverflow"
-#define COMPONENT_YEAR "2023"
+#define COMPONENT_YEAR "2024"
 
 #define COMPONENT_VERSION_MAJOR 1
 
 #define COMPONENT_VERSION_MINOR 18
-#define COMPONENT_VERSION_PATCH 2
+#define COMPONENT_VERSION_PATCH 3
 #define COMPONENT_VERSION_SUB_PATCH 0
 
 #define MAKE_STRING(text) #text
