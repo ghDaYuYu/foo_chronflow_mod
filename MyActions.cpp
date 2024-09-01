@@ -395,11 +395,26 @@ class ActionDisplayConfig : public CustomAction {
   int m_post;
 };
 
+class ActionOpenImageViewer : public CustomAction {
+ public:
+  ActionOpenImageViewer()
+      : CustomAction("", false) {
+    actionName = "Open image viewer";
+    bPlaylistAction = false;
+  }
+  void run(const pfc::list_base_const_t<metadb_handle_ptr>& tracks,
+           const char* /*albumTitle*/, HWND hwnd, int flag){};
+
+  void sendconfig(HWND hwnd) override {
+    SendMessage(hwnd, WM_MYACTIONS_OPEN_IMAGE_VIEWER, (WPARAM) nullptr, (LPARAM) nullptr);
+  }
+};
+
 }  // namespace
 
 std::vector<CustomAction*> g_customActions{
     new TargetActivePlaylist, new TargetDefaultPlaylist, new NewPlaylist,
-    new ActionDisplayConfig(-1,1), new ActionDisplayConfig(0, -1)};
+    new ActionDisplayConfig(-1,1), new ActionDisplayConfig(0, -1), new ActionOpenImageViewer};
 
 void executeAction(const char* action, const ::db::AlbumInfo& album, HWND hwnd,
                    int flag) {

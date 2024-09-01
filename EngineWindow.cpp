@@ -168,6 +168,14 @@ LRESULT EngineWindow::messageHandler(UINT uMsg, WPARAM wParam, LPARAM lParam) {
     case WM_MYACTIONS_SET_DISPLAY:
       cmdActivateVisualization(MAKELPARAM((int)wParam,lParam), (LPARAM)hWnd);
       break;
+    case WM_MYACTIONS_OPEN_IMAGE_VIEWER: {
+      std::optional<AlbumInfo> target;
+      target = engineThread->sendSync<EM::GetTargetAlbum>().get();
+      if (target) {
+        cmdShowAlbumOnExternalViewer(target.value());
+      }
+      return 0;
+    }
     //todo: remove all actions in playlist mode
     case WM_MYACTIONS_CANCELED:
       // MessageBeep(MB_ICONINFORMATION);

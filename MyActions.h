@@ -4,6 +4,7 @@
 
 #define WM_MYACTIONS_CANCELED (WM_USER + 1000)
 #define WM_MYACTIONS_SET_DISPLAY (WM_USER + 1001)
+#define WM_MYACTIONS_OPEN_IMAGE_VIEWER (WM_USER + 1002)
 
 bool isInactivePlaylistPlayFixed(int amajor, int aminor, int arevision /*, int abuild*/);
 
